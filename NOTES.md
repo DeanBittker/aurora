@@ -23,8 +23,9 @@ Idea: borrow a pretrained protein language model instead of training from scratc
 every sequence through ESM-2 650M, frozen, mean-pool to one vector, cache the vectors,
 then train a cheap head on them. Embed once, reuse forever.
 
-Two heads on purpose. Ridge as a linear baseline, a small MLP as the learned
-head. If Ridge already ranks well, the signal is in the embeddings and the head barely matters.
+Two heads on purpose. Ridge as an honest linear baseline, a small MLP as the learned
+head. If Ridge already ranks well, the signal is in the embeddings and the head barely
+matters.
 
 Results:
 - test Spearman 0.61 (Ridge), 0.63 (MLP).
@@ -41,31 +42,45 @@ Takeaway that sets up everything later: the oracle ranks fine but is confidently
 miscalibrated in the region it never saw. That gap is exactly what a naive optimizer
 would exploit.
 
-## Step 3. Oracle v2: fine-tune plus uncertainty (in progress)
+## Step 3. Oracle v2: fine-tune plus uncertainty
 
 Two upgrades aimed at v1's weakness.
 
 Fine-tune the backbone instead of freezing it. ESM-2 150M, full fine-tune, the size
 that actually trains on the Mac. Different learning rates, small on the backbone
-(2e-5), larger on the head (1e-3). This should lift the headline number.
+(2e-5), larger on the head (1e-3).
 
 Add uncertainty with a deep ensemble. Three fine-tunes from different seeds, and the
 spread across them is the uncertainty. This is epistemic uncertainty (the model's own
 ignorance) on purpose, not aleatoric (noise in the data). Epistemic is what flags the
 out-of-distribution region and what the step 6 optimizer will try to game.
 
-The question this step answers: does the uncertainty rise on the test set? If the
-ensemble is more unsure out in the dark region it never trained on, the oracle knows
-where it is ignorant, and we can use that later to keep the optimizer honest.
+Results:
+- test Spearman 0.67, up from v1's 0.62. Fine-tuned 150M beat frozen 650M. A smaller
+  model that adapts to the task beats a bigger one held fixed.
+- test RMSE 0.51, down from v1's 0.84 to 0.96. Absolute predictions on the far set are
+  much less biased now. Fine-tuning fixed a lot of the OOD bias, not just the ranking.
+- the extrapolation gap is still there. valid Spearman 0.77, test 0.67, about a 0.10
+  drop. Fine-tuning lifts the whole curve but does not erase the shift. Expected.
+- calibration, the point of this step:
+  - mean ensemble std is higher on test (0.187) than valid (0.141). The ensemble is
+    more unsure out in the dark region it never trained on. The oracle knows where it
+    is ignorant. This is the signal step 6 needs.
+  - err_vs_std is positive and higher on test (0.52) than valid (0.39). Where the
+    ensemble is uncertain it tends to be more wrong, and that link is stronger OOD.
+  - the intervals are overconfident. cov68 is 0.31 to 0.40 against an ideal of 0.68,
+    cov90 is 0.61 to 0.64 against 0.90. A K=3 ensemble underestimates the size of the
+    uncertainty. The direction and ranking are right, the magnitude needs recalibration
+    (temperature scaling or conformal) if we ever need honest intervals.
 
-Results: pending the full run. Fill in test Spearman vs the v1 0.62 baseline, and the
-mean ensemble std on valid vs test (the number that says whether uncertainty rises out
-of distribution).
+Takeaway: fine-tuning helped the headline and the OOD bias, and the ensemble
+uncertainty rises out of distribution and tracks error. That rise is the lever step 6
+will use. The one caveat is overconfident intervals, fixable later.
 
 ## Where this is going
 
-v1 found that the oracle is confidently wrong out of distribution. v2 is about making
-it know when it is out of its depth. Step 4 puts the oracle in a closed loop with a
-proposer. Step 6 is the centerpiece: show an optimizer exploiting the oracle's blind
-spots, then fix it with a trust region or an uncertainty penalty built on exactly the
-uncertainty v2 is measuring now.
+v1 found that the oracle is confidently wrong out of distribution. v2 made it more
+accurate and gave it an uncertainty that rises where it should. Step 4 puts the oracle
+in a closed loop with a proposer. Step 6 is the centerpiece: show an optimizer
+exploiting the oracle's blind spots, then fix it with a trust region or an uncertainty
+penalty built on exactly the uncertainty v2 is measuring now.
