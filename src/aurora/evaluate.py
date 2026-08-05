@@ -2,31 +2,33 @@
 
 Step 4 showed the loop optimizing the oracle runs away from truth: the oracle's
 predicted brightness climbs far past anything real while the true score lags. This
-measures that gap and then reduces it with a trust region built on uncertainty.
+measures that gap and then reduces it with a trust region.
 
 The pieces:
 
-  1. An oracle that reports uncertainty. Instead of a single Ridge fit, we fit an
-     ensemble of Ridge heads on bootstrap resamples of the train set. Their spread
-     is small near the training data and grows as candidates drift away from it, so
-     the spread is a usable "how far out am I" signal.
+  1. The oracle. An ensemble of Ridge heads on bootstrap resamples of the train set,
+     giving a mean prediction. This is the thing the loop optimizes, and it is only
+     trained on the near region, so it is untrustworthy far out.
 
   2. An honest ground truth. A random forest on all the data. A linear model
-     extrapolates without bound out of distribution, so it happily predicts
-     brightness past the brightest protein ever measured. A forest only ever
-     averages real training labels, so a far design gets scored like the real
-     variants nearest it, which out there are mostly dark. That is a believable
-     stand-in for reality where a linear model is not.
+     extrapolates without bound out of distribution and predicts brightness past the
+     brightest protein ever measured. A forest only averages real training labels, so
+     a far design gets scored like the real variants nearest it, which out there are
+     mostly dark. That is a believable stand-in for reality where a linear model is
+     not.
 
-  3. The fix: a trust region. Select candidates by mean - lam * std instead of mean.
-     A larger lam refuses to chase sequences the oracle is unsure about, which keeps
-     the loop inside the region the oracle can be trusted. lam = 0 is the greedy,
-     reward-hacking loop from step 4.
+  3. The fix: a trust region on distance from the training data. We first tried a
+     penalty on the ensemble's own uncertainty, but its spread was too small to hold
+     the line against an oracle mean running off to 11. Distance from the training
+     embeddings is a stronger, monotonic "how far out am I" signal: it grows steadily
+     as the design drifts, so penalizing it keeps the search inside the region the
+     oracle can be trusted. Select by mean - lam * distance. lam = 0 is the greedy,
+     reward-hacking loop.
 
-We run the loop across a few lam values and look at two things per round: the gap
-between oracle score and true score, and the true brightness of the design. The
-greedy run should show a widening gap and designs that are not actually bright. The
-trust-region runs should show a smaller gap and designs that hold up in truth.
+We sweep lam and look at two things per round: the gap between oracle score and true
+score, and the true brightness of the design. The greedy run should show a big gap
+and dim designs. A large enough lam should shrink the gap and pull the designs back
+up to genuinely bright.
 
 Run it:
     uv run python -m aurora.evaluate
@@ -46,11 +48,7 @@ _RESULTS = Path(__file__).resolve().parents[2] / "results"
 
 
 def build_oracle_ensemble(Xtr, ytr, k=20, alpha=10.0, seed=0):
-    """Ensemble of Ridge heads on bootstrap resamples of the train set.
-
-    Returns mean_std(X) -> (mean, std). The mean is the oracle prediction, the std
-    is the disagreement across the ensemble, which grows out of distribution.
-    """
+    """Ensemble of Ridge heads on bootstrap resamples. Returns mean(X) -> scores."""
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
 
@@ -61,25 +59,21 @@ def build_oracle_ensemble(Xtr, ytr, k=20, alpha=10.0, seed=0):
 
     coefs, intercepts = [], []
     for _ in range(k):
-        idx = rng.integers(0, n, size=n)          # sample with replacement
+        idx = rng.integers(0, n, size=n)
         model = Ridge(alpha=alpha).fit(Xs[idx], ytr[idx])
         coefs.append(model.coef_)
         intercepts.append(model.intercept_)
-    coefs = np.stack(coefs)                        # (k, hidden)
-    intercepts = np.array(intercepts)             # (k,)
+    coefs = np.stack(coefs)
+    intercepts = np.array(intercepts)
 
-    def mean_std(X):
-        preds = scaler.transform(X) @ coefs.T + intercepts   # (n, k)
-        return preds.mean(axis=1), preds.std(axis=1)
+    def mean(X):
+        return (scaler.transform(X) @ coefs.T + intercepts).mean(axis=1)
 
-    return mean_std
+    return mean
 
 
 def build_ground_truth(X_all, y_all, n_trees=200, seed=0):
-    """Random forest on all the data. It cannot extrapolate past the real label
-    range, so out-of-distribution designs get scored like the real variants nearest
-    them instead of blowing up the way a linear model does.
-    """
+    """Random forest on all the data. Cannot extrapolate past the real label range."""
     from sklearn.ensemble import RandomForestRegressor
 
     model = RandomForestRegressor(
@@ -88,11 +82,36 @@ def build_ground_truth(X_all, y_all, n_trees=200, seed=0):
     return model.predict
 
 
-def evolve(mean_std, ground_truth, embed, start, lam,
-           rounds=12, children_per_parent=20, n_mut=1, keep=10, seed=0):
-    """One directed-evolution run selecting by mean - lam * std.
+def build_distance(Xtr, k=10, sample=3000, seed=0):
+    """Distance from the training embeddings, a direct out-of-distribution signal.
 
-    Records (round, oracle_mean, oracle_std, true) for the selected best each round.
+    For a candidate, take the mean distance to its k nearest training sequences,
+    normalized by the typical distance among training points. In-distribution
+    candidates land near 1, and it grows as candidates drift away from the data.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    knn = NearestNeighbors(n_neighbors=k).fit(Xtr)
+
+    def raw(X):
+        d, _ = knn.kneighbors(X)
+        return d.mean(axis=1)
+
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(Xtr), size=min(sample, len(Xtr)), replace=False)
+    scale = float(np.median(raw(Xtr[idx]))) or 1.0
+
+    def distance(X):
+        return raw(X) / scale
+
+    return distance
+
+
+def evolve(oracle_mean, distance, ground_truth, embed, start, lam,
+           rounds=12, children_per_parent=20, n_mut=1, keep=10, seed=0):
+    """One directed-evolution run selecting by mean - lam * distance.
+
+    Records (round, oracle_mean, distance, true) for the selected best each round.
     """
     import random
 
@@ -104,27 +123,30 @@ def evolve(mean_std, ground_truth, embed, start, lam,
         pool = list(dict.fromkeys(population + children))
 
         X = embed(pool)
-        mean, std = mean_std(X)
-        selection = mean - lam * std              # the trust region
+        mean = oracle_mean(X)
+        dist = distance(X)
+        selection = mean - lam * dist            # the trust region
         order = np.argsort(selection)[::-1]
         population = [pool[i] for i in order[:keep]]
 
         best = order[0]
         true = float(ground_truth(X[best:best + 1])[0])
-        history.append((r, float(mean[best]), float(std[best]), true))
+        history.append((r, float(mean[best]), float(dist[best]), true))
     return history
 
 
-def main(lambdas=(0.0, 2.0, 4.0, 8.0)):
+def main(lambdas=(0.0, 2.0, 5.0, 10.0)):
     df = load_gfp()
     X_all = get_embeddings(df)
     y = df["log_fluorescence"].to_numpy()
     is_train = (df["split"] == "train").to_numpy()
 
     print("[eval] building bootstrap-ensemble oracle (train only)...")
-    mean_std = build_oracle_ensemble(X_all[is_train], y[is_train])
+    oracle_mean = build_oracle_ensemble(X_all[is_train], y[is_train])
     print("[eval] building random-forest ground truth (all data)...")
     ground_truth = build_ground_truth(X_all, y)
+    print("[eval] building distance-to-training-data trust region...")
+    distance = build_distance(X_all[is_train])
 
     embed = _make_embedder()
     start = _wild_type(df)
@@ -132,11 +154,11 @@ def main(lambdas=(0.0, 2.0, 4.0, 8.0)):
     runs = {}
     for lam in lambdas:
         print(f"\n=== lambda = {lam} ===")
-        hist = evolve(mean_std, ground_truth, embed, start, lam)
+        hist = evolve(oracle_mean, distance, ground_truth, embed, start, lam)
         runs[lam] = hist
         last = hist[-1]
         gap = last[1] - last[3]
-        print(f"  final: oracle {last[1]:.2f}  std {last[2]:.2f}  "
+        print(f"  final: oracle {last[1]:.2f}  dist {last[2]:.2f}  "
               f"true {last[3]:.2f}  gap {gap:.2f}")
 
     _plot(runs)
