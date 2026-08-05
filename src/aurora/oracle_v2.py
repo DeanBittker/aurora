@@ -10,7 +10,7 @@ does two things about that.
      predictions is an uncertainty estimate. The question that matters is whether
      that spread gets larger out on the far, mostly-dark test set the models never
      saw. If it does, the oracle knows where it is ignorant. That is the property a
-     naive optimizer will try to exploit later, in step 6.
+     naive optimizer will try to exploit later, in step 5.
 
 Same split rules as always. Train on `train`, pick the checkpoint on `valid`,
 report `test`. The target is standardized on train stats for stable optimization

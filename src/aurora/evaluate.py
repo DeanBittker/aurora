@@ -1,4 +1,4 @@
-"""Step 6. Reward hacking, and a fix.
+"""Step 5. Reward hacking, and a fix.
 
 Step 4 showed the loop optimizing the oracle runs away from truth: the oracle's
 predicted brightness climbs far past anything real while the true score lags. This
